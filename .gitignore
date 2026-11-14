@@ -1,0 +1,11 @@
+.venv/
+.pydeps/
+__pycache__/
+*.pyc
+.pytest_cache/
+data/
+*.tmp
+*.tmp.*
+.DS_Store
+# 样例数据可由 samples/generate_samples.py 重新生成；如需只保留脚本可取消下一行注释
+# samples/data/
