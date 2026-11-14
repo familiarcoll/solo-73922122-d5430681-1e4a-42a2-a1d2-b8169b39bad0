@@ -35,9 +35,15 @@ class TaskRecord:
     created_at: str = field(default_factory=_utc_now_iso)
     started_at: str | None = None
     finished_at: str | None = None
+    # 受理是否已完整完成（写入注册表 + 工作线程启动成功）。
+    # 未完成受理的残留记录在重启恢复时会被丢弃，而不是伪装成 failed 任务。
+    admitted: bool = True
     # 仅运行期使用，不写入注册表
     stop_event: threading.Event | None = field(default=None, repr=False)
     worker: threading.Thread | None = field(default=None, repr=False)
+    slot_held: bool = field(default=False, repr=False)
+    # 工作线程在此事件放行前不得触碰任何状态/注册表
+    admission_gate: threading.Event | None = field(default=None, repr=False)
 
     def to_dict(self) -> dict:
         out = {
@@ -66,6 +72,8 @@ class TaskManager:
         self._lock = threading.RLock()
         self._tasks: dict[str, TaskRecord] = {}
         self._active = 0
+        # 可替换的线程工厂：故障注入用例可借此让 start() 失败
+        self._thread_factory = threading.Thread
         os.makedirs(settings.upload_dir, exist_ok=True)
         os.makedirs(settings.result_dir, exist_ok=True)
         self._recover_from_registry()
@@ -75,7 +83,7 @@ class TaskManager:
 
     def _persist_locked(self) -> None:
         payload = {
-            tid: rec.to_dict()
+            tid: {**rec.to_dict(), "admitted": rec.admitted}
             for tid, rec in self._tasks.items()
         }
         tmp = f"{self.settings.registry_path}.tmp"
@@ -84,7 +92,13 @@ class TaskManager:
         os.replace(tmp, self.settings.registry_path)
 
     def _recover_from_registry(self) -> None:
-        """重启后未完成任务一律记 FAILED；已完成结果保持可下载。"""
+        """重启后未完成任务一律记 FAILED；已完成结果保持可下载。
+
+        受理未完成的记录（登记写入或线程启动失败后残留）直接丢弃：
+        它们从未真正进入任务生命周期，不得因此变成可查询的 failed 任务。
+        """
+        # 上次受理中途失败可能遗留注册表临时文件，一并清理
+        self._safe_remove(f"{self.settings.registry_path}.tmp")
         path = self.settings.registry_path
         if not os.path.exists(path):
             return
@@ -96,6 +110,9 @@ class TaskManager:
 
         now = _utc_now_iso()
         for task_id, data in payload.items():
+            if not data.get("admitted", True):
+                # 失败受理的残留记录：重启后既不恢复也不占位
+                continue
             state = data.get("state")
             result_basename = None
             if state == states.COMPLETED:
@@ -130,6 +147,7 @@ class TaskManager:
                 created_at=data.get("created_at", now),
                 started_at=data.get("started_at"),
                 finished_at=now,
+                admitted=True,
             )
             self._tasks[task_id] = rec
         self._persist_locked()
@@ -159,7 +177,13 @@ class TaskManager:
         stations: list[Station],
         saved_upload_path: str,
     ) -> TaskRecord:
-        """满额（已达并行上限）直接拒绝，不排队。"""
+        """满额（已达并行上限）直接拒绝，不排队。
+
+        受理是一次全有或全无的交接：只有当「登记写入」与「工作线程启动」
+        都成功，任务才对查询可见并占用并行槽位。任一步失败都会撤销登记、
+        释放槽位、删除暂存文件，并抛出 AdmissionFailed；调用方据此返回 5xx，
+        不会有任何可查询的残留任务。
+        """
         with self._lock:
             if self._active >= self.settings.max_parallel_tasks:
                 raise CapacityExhausted(
@@ -173,21 +197,69 @@ class TaskManager:
                 station_count=len(stations),
                 upload_path=saved_upload_path,
                 stop_event=threading.Event(),
+                admitted=False,
+                slot_held=True,
+                admission_gate=threading.Event(),
             )
             self._tasks[task_id] = rec
             self._active += 1
-            self._persist_locked()
 
-            rec.worker = threading.Thread(
-                target=self._run,
-                name=f"extract-{task_id}",
-                args=(rec, grid, stations),
-                daemon=True,
-            )
-            rec.worker.start()
+            try:
+                # 1) 登记写入：失败则整体回滚
+                self._persist_locked()
+                # 2) 线程启动：工作线程先等待 gate，受理成功后才允许运行
+                worker = self._thread_factory(
+                    target=self._run_after_admission,
+                    name=f"extract-{task_id}",
+                    args=(rec, grid, stations),
+                    daemon=True,
+                )
+                worker.start()
+            except BaseException as exc:
+                self._rollback_admission_locked(rec)
+                raise AdmissionFailed(f"任务受理失败: {exc}") from exc
+
+            # 3) 两道关卡都通过：正式提交（提交本身也要落盘，失败同样回滚）
+            try:
+                rec.worker = worker
+                rec.admitted = True
+                self._persist_locked()
+            except BaseException as exc:
+                self._rollback_admission_locked(rec)
+                raise AdmissionFailed(f"任务受理失败: {exc}") from exc
+            rec.admission_gate.set()
             return rec
 
+    def _rollback_admission_locked(self, rec: TaskRecord) -> None:
+        """撤销一次未完成的受理：登记、槽位、暂存文件全部不留痕。"""
+        rec.admitted = False
+        self._tasks.pop(rec.task_id, None)
+        if rec.slot_held:
+            self._active -= 1
+            rec.slot_held = False
+        # 放行可能已创建的工作线程，让它在 _run_after_admission 中立即退出
+        if rec.admission_gate is not None:
+            rec.admission_gate.set()
+        try:
+            self._persist_locked()
+        except Exception:
+            # 注册表本身不可写时，至少保证内存态与暂存文件干净；
+            # 磁盘上残留的 admitted=false 记录会在重启恢复时被丢弃
+            self._safe_remove(f"{self.settings.registry_path}.tmp")
+        self._safe_remove(rec.upload_path)
+
     # --------------------------- 工作线程 ---------------------------
+
+    def _run_after_admission(
+        self, rec: TaskRecord, grid: GridInfo, stations: list[Station]
+    ) -> None:
+        """等待受理提交后再进入计算；未获放行则静默退出。"""
+        gate = rec.admission_gate
+        if gate is not None:
+            gate.wait()
+            if not rec.admitted:
+                return
+        self._run(rec, grid, stations)
 
     def _run(
         self, rec: TaskRecord, grid: GridInfo, stations: list[Station]
@@ -262,7 +334,9 @@ class TaskManager:
             rec.finished_at = _utc_now_iso()
             rec.stop_event = None
             rec.worker = None
-            self._active -= 1
+            if rec.slot_held:
+                self._active -= 1
+                rec.slot_held = False
             self._persist_locked()
 
         # 任务结束后释放上传文件（结果 CSV 是唯一交付物）；
@@ -312,6 +386,10 @@ class TaskManager:
 
 class CapacityExhausted(RuntimeError):
     """并行槽位已满。"""
+
+
+class AdmissionFailed(RuntimeError):
+    """受理交接失败（登记写入或工作线程启动出错），未留下任何任务。"""
 
 
 class TaskNotFound(KeyError):

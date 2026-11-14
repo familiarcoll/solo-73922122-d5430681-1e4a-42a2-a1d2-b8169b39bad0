@@ -15,6 +15,7 @@
 | 最近格点 | 按**球面 haversine 距离**选最近格点；兼容**降序纬度**与 **0–360 / -180–180 两种经度** |
 | 缺测 | 网格缺测（NaN）在 CSV 中以**空字段**输出 |
 | 并行度 | 最多 **2 个任务并行**，满额直接 **409 拒绝**（不排队） |
+| 受理交接 | 登记写入或工作线程启动失败时返回 **503**，**不留下可查询任务、不占用并行名额、清除上传暂存**；此类残留也不会在重启后恢复 |
 | 计算时限 | 自任务开始计算起 **60 秒**，超时判 `timeout` |
 | 取消 | 任意时刻可取消；受理后绝不发布迟到结果 |
 | 清理 | 取消 / 失败 / 超时均等实际计算停止、文件关闭后才清理暂存，且不影响其他任务 |
@@ -37,7 +38,7 @@
 │   ├── generate_samples.py  # 生成虚构网格、站点与慢提取样例
 │   ├── demo_api.sh          # 端到端操作演示脚本
 │   └── data/                # 生成的样例文件（运行脚本后出现）
-├── tests/                 # pytest 测试（29 个，含并发/取消/超时/重启恢复）
+├── tests/                 # pytest 测试（36 个，含并发/取消/超时/重启恢复/受理故障回滚）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -57,6 +58,16 @@ docker compose up --build
 ```
 
 健康检查：`GET http://localhost:8000/health`
+
+### 在 /docs 中完成一次提取
+
+1. `POST /api/tasks` → **Try it out**：上传 `samples/data/demo_grid.nc`，`variable` 填 `tas`，
+   `stations_file` 选择 `samples/data/stations.csv`（`stations_json` 留空），执行后得到 `task_id`。
+2. `GET /api/tasks/{task_id}` → 查询进度，状态变为 `completed` 即可下载。
+3. `GET /api/tasks/{task_id}/download` → **Try it out** 并 Execute，浏览器直接下载完整 CSV。
+
+也可以直接复制 201 响应里的 `download` 路径到浏览器地址栏。服务未就绪时 `docker compose ps`
+可查看健康检查状态；容器使用命名卷 `climate_data` 持久化注册表与结果，重启后已完成结果仍可下载。
 
 ### 不使用 Docker（本地运行）
 
@@ -95,6 +106,9 @@ pending → running ─┬─→ completed
                    ├─→ timeout
  running/cancelling ─→ cancelled
 ```
+
+受理是原子的：登记写入与工作线程启动都成功后才算受理成功（`201`）。任一步失败返回 `503`，
+登记、并行名额与上传暂存全部回滚，`GET /api/tasks` 中不会出现该任务。
 
 ### 输出 CSV 格式
 
@@ -143,6 +157,7 @@ demo_chunk_steps = 5
 - **超时语义**：截止时间为 `开始计算时刻 + 60s` 的单调时钟，与取消共用同一检查点，超时同样不发布结果。
 - **线程安全**：manylinux 版 netCDF4/HDF5 wheel 非线程安全，并发进入会段错误；`netcdf_guard.netcdf_lock` 将所有 HDF5 打开/读取/关闭串行化，而 CSV 拼装与慢提取休眠在锁外，两个任务仍可并行调度。
 - **重启恢复**：任务元数据持久化于 `data/registry.json`（原子写）。启动时未处于终态的任务一律标记 `failed`（原因“服务重启，任务未完成”）；completed 任务仅在 CSV 文件存在时保持可下载，否则降级为 failed。
+- **受理交接**：`create_task` 先校验容量、写登记、启动工作线程，线程被 `admission_gate` 挡住直到提交完成；登记或 `Thread.start()` 抛错时整体回滚（移除内存记录、释放槽位、删除暂存、重写注册表），API 返回 503。注册表中标记 `admitted=false` 的半截记录在重启时被丢弃，不会变成可查询的 failed 任务或占用名额。故障注入回归用例见 `tests/test_admission.py`。
 
 ## 运行测试
 
@@ -151,7 +166,7 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-测试覆盖：网格/公历/站点校验、球面最近格点（降序纬度、经度约定）、缺测留空、取消、超时、并发上限与槽位释放、下载门禁、重启恢复，共 29 项。
+测试覆盖：网格/公历/站点校验、球面最近格点（降序纬度、经度约定）、缺测留空、取消、超时、并发上限与槽位释放、下载门禁、重启恢复、受理故障回滚（登记写入失败 / 线程启动失败 / 提交落盘失败 / 残留记录不恢复），共 36 项。
 
 ## 配置（环境变量）
 

@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from . import __version__
 from .config import Settings
 from .task_manager import (
+    AdmissionFailed,
     CapacityExhausted,
     ResultNotReady,
     TaskManager,
@@ -123,6 +124,8 @@ async def create_task(
             rec = manager.create_task(grid, stations, upload_path)
         except CapacityExhausted as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except AdmissionFailed as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
     except HTTPException:
         if os.path.exists(upload_path):
             os.remove(upload_path)
